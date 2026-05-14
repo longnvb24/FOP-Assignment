@@ -1,295 +1,874 @@
-import numpy as np
+"""
+warehouse.py  –  Robotic Warehouse Simulation
+==============================================
+Simulates autonomous robots collecting goods from shelf locations
+and returning them to their home corners in a grid-based environment.
+
+Usage
+-----
+Interactive : python3 warehouse.py -i
+Batch       : python3 warehouse.py -f map1.csv -p params1.csv
+Save map    : python3 warehouse.py -i --save-map my_map.csv
+"""
+
+import argparse
+import csv
 import random
+from collections import deque, Counter
+
+import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-# Constants for cell types
-EMPTY = 0   # Cell empty (path)
-SHELF = 1   # Shelf (obstacle)
+# Grid cell values
+EMPTY = 0   # Walkable aisle cell
+SHELF = 1   # Impassable shelf cell
 
-# Constants for robot states
-STATE_IDLE      = "idle"
-STATE_MOVING    = "moving_to_good"
-STATE_RETURNING = "returning"
+# Robot state labels 
+STATE_IDLE      = "idle"             # No current task
+STATE_MOVING    = "moving_to_good"   # Travelling toward a target good
+STATE_RETURNING = "returning"        # Carrying a good back to home corner
 
-# Colors for robots (up to 8)
+# Colours for up to 8 robots in the visualisation
 ROBOT_COLOURS = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12",
                  "#9b59b6", "#1abc9c", "#e67e22", "#34495e"]
 
-# Possible movement directions (up, down, left, right)
+# Four possible movement directions (up, down, left, right)
 DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
+
+class Good:
+    '''
+    Good: represents a single collectable item stored on a shelf cell.
+    Attributes
+        good_id   - unique identifier (int)
+        row       - row index of the shelf cell (int)
+        col       - column index of the shelf cell (int)
+        available - True if unclaimed; False once reserved by a robot (bool)
+    '''
+
+    counter = 0
+
+    def __init__(self, row, col):
+        '''
+        __init__ - creates a new Good at the given shelf cell.
+            row - row index of the shelf location (int)
+            col - column index of the shelf location (int)
+        '''
+        Good.counter  += 1
+        self.good_id   = Good.counter # auto-incrementing unique ID
+        self.row       = row
+        self.col       = col
+        self.available = True
+
+    def __repr__(self):
+        status = "available" if self.available else "reserved"
+        return f"Good({self.good_id}) @ ({self.row},{self.col}) [{status}]"
+
+
 class Robot:
-    """
-    Automatic warehouse robot.
- 
-    robot_id  : unique identifier (1, 2, 3, ...)
-    row, col  : current position on the grid
-    home_row, home_col : home corner (unchanged)
-    state     : current state ("idle" / "moving_to_good" / "returning")
-    carrying  : True if carrying goods
-    goods_delivered : number of goods delivered successfully
-    """
- 
-    def __init__(self, robot_id, row, col):
+    '''
+    Robot: an autonomous warehouse robot that collects goods and returns home.
+
+    Attributes
+        robot_id           - unique identifier (int)
+        row, col           - current grid position (int)
+        home_row, home_col - row and column of the home corner; never changes (int)
+        grid               - reference to the warehouse grid (list of lists)
+        state              - current state string (str)
+        target_good        - Good object this robot is heading for, or None
+        path               - remaining waypoints [(row,col), ...] (list)
+        carrying           - True while the robot holds a good (bool)
+        goods_delivered    - count of goods successfully returned home (int)
+        steps_taken        - total movement steps taken (int)
+        idle_steps         - timesteps spent in idle state (int)
+    '''
+
+    def __init__(self, robot_id, row, col, grid):
+        '''
+        __init__ - initialises a robot at a corner spawn position.
+
+        robot_id - unique robot number (int)
+        row      - starting row / home row (int)
+        col      - starting column / home column (int)
+        grid     - warehouse grid used for pathfinding (list of lists)
+        '''
         self.robot_id        = robot_id
         self.row             = row
         self.col             = col
         self.home_row        = row
         self.home_col        = col
+        self.grid            = grid
         self.state           = STATE_IDLE
+        self.target_good     = None
+        self.path            = []
         self.carrying        = False
         self.goods_delivered = 0
- 
-    def __repr__(self):
-        return (f"Robot({self.robot_id}) "
-                f"pos=({self.row},{self.col}) "
-                f"home=({self.home_row},{self.home_col}) "
-                f"state={self.state}")
+        self.steps_taken     = 0
+        self.idle_steps      = 0
 
-class Good:
-    """
-    A good in the warehouse
- 
-    good_id   : unique identifier (1, 2, 3, ...)
-    row, col  : position on the grid
-    available : True  → not taken yet
-                False → robot has reserved it
-    """
- 
-    counter = 0   # Global counter for all Good instances
- 
-    def __init__(self, row, col):
-        Good.counter += 1
-        self.good_id   = Good.counter
-        self.row       = row
-        self.col       = col
-        self.available = True
- 
-    def __repr__(self):
-        status = "available" if self.available else "reserved"
-        return f"Good({self.good_id}) @ ({self.row},{self.col}) [{status}]"
+    def step_change(self, goods):
+        '''
+        step_change - advances the robot by one timestep.
+        Called once per timestep by the simulation loop.
 
-# ── Hàm tìm hàng gần nhất (trả lời Prompt 1, 2, 3) ──────────────────────────
+        goods - list of all Good objects currently in the warehouse (list)
+        '''
+        if self.state == STATE_IDLE: # if idle, try to find a new target
+            self.assign_target(goods)
+
+        elif self.state == STATE_MOVING: # if moving, take a step along the path
+            if self.path: # if path is not empty, pop the next waypoint and move there
+                self.row, self.col = self.path.pop(0)
+                self.steps_taken  += 1
+            self.check_pickup(goods) # check if robot reached the target good
+
+        elif self.state == STATE_RETURNING: # if returning, take a step toward home
+            if self.path: # if path is not empty, pop the next waypoint and move there
+                self.row, self.col = self.path.pop(0)
+                self.steps_taken  += 1
+            if (self.row, self.col) == (self.home_row, self.home_col): # if reached home, drop the good and reset state
+                self.carrying         = False
+                self.goods_delivered += 1
+                self.state            = STATE_IDLE
+
+    def assign_target(self, goods):
+        '''
+        assign_target - finds the nearest available good and reserves it.
+        Transitions state from idle -> moving_to_good.
+
+        goods - list of all Good objects (list)
+        '''
+        target = find_nearest_good(goods, self.row, self.col)
+        if target is None:
+            self.idle_steps += 1
+            return
+
+        pickup = get_pickup_cells(self.grid, target)
+        path   = bfs(self.grid, self.row, self.col, pickup)
+
+        if not path and (self.row, self.col) not in set(pickup):
+            self.idle_steps += 1
+            return
+
+        target.available = False   # reserve immediately; prevents other robots claiming it
+        self.target_good = target
+        self.path        = path
+        self.state       = STATE_MOVING
+
+    def check_pickup(self, goods):
+        '''
+        check_pickup - checks whether the robot has reached a pickup cell.
+        If the target good has disappeared (taken by another robot before
+        arrival), the robot retargets automatically.
+        Transitions state from moving_to_good --> returning on success.
+
+        goods - list of all Good objects (list)
+        '''
+        if not self.target_good:
+            self.state = STATE_IDLE
+            return
+
+        # Retarget if the good was removed before this robot arrived
+        if self.target_good not in goods:
+            self.target_good = None
+            self.path        = []
+            self.state       = STATE_IDLE
+            return
+
+        pickup = set(get_pickup_cells(self.grid, self.target_good))
+        if (self.row, self.col) in pickup and not self.path:
+            goods.remove(self.target_good)
+            self.carrying    = True
+            self.target_good = None
+            self.state       = STATE_RETURNING
+            self.path        = bfs(self.grid, self.row, self.col,
+                                   [(self.home_row, self.home_col)])
+
+    def __repr__(self):
+        return (f"Robot({self.robot_id}) @ ({self.row},{self.col}) "
+                f"state={self.state} delivered={self.goods_delivered}")
+
+
+# ── Pathfinding helpers ───────────────────────────────────────────────────────
+def get_pickup_cells(grid, good):
+    '''
+    get_pickup_cells - returns all EMPTY cells directly adjacent to a shelf cell.
+    These are the positions a robot must stand on to collect the good.
+
+    grid - warehouse grid (list of lists)
+    good - the Good object whose shelf location is queried (Good)
+    '''
+    rows = len(grid)
+    cols = len(grid[0])
+    return [
+        (good.row + dr, good.col + dc)
+        for dr, dc in DIRECTIONS
+        if (0 <= good.row + dr < rows and 0 <= good.col + dc < cols
+            and grid[good.row + dr][good.col + dc] == EMPTY)
+    ]
+
+
+def bfs(grid, sr, sc, goals):
+    '''
+    bfs - Breadth-First Search shortest path on the warehouse grid.
+    Shelf cells are treated as impassable walls.
+
+    grid  - warehouse grid (list of lists)
+    sr    - start row (int)
+    sc    - start column (int)
+    goals - set of destination (row, col) tuples (list or set)
+
+    Returns list of (row, col) waypoints from start to goal (exclusive start,
+    inclusive goal). Returns [] if already at a goal or no path exists.
+    '''
+    rows  = len(grid)
+    cols  = len(grid[0])
+    goals = set(goals)
+    start = (sr, sc)
+
+    if start in goals:
+        return []
+
+    queue   = deque([(start, [])])
+    visited = {start}
+
+    while queue:
+        (r, c), path = queue.popleft()
+        for dr, dc in DIRECTIONS:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < rows and 0 <= nc < cols):
+                continue
+            if (nr, nc) in visited or grid[nr][nc] == SHELF:
+                continue
+            new_path = path + [(nr, nc)]
+            if (nr, nc) in goals:
+                return new_path
+            visited.add((nr, nc))
+            queue.append(((nr, nc), new_path))
+    return []
+
+
 def find_nearest_good(goods, robot_row, robot_col):
-    """
-    Find the nearest available good to the robot's current position.
- 
-    - Only consider goods that are still available (available=True)
-    - Return the Good object (not an index) → robot will set available=False
-    - If no available goods remain → return None
-    """
+    '''
+    find_nearest_good - returns the nearest available Good by Manhattan distance.
+
+    goods      - list of all Good objects (list)
+    robot_row  - current row of the robot (int)
+    robot_col  - current column of the robot (int)
+
+    Returns the closest Good with available=True, or None if none exist.
+    '''
     best      = None
     best_dist = float("inf")
- 
     for good in goods:
         if not good.available:
-            continue   # Bỏ qua kiện đã bị đặt chỗ
- 
+            continue
         dist = abs(good.row - robot_row) + abs(good.col - robot_col)
         if dist < best_dist:
             best_dist = dist
             best      = good
- 
-    return best   # None nếu không còn hàng available
+    return best
 
-def make_robots(grid, num_robots):
-    """
-    Create num_robots Robot instances, placing them in the 4 corners of the grid.
-    If num_robots > 4, the additional robots share corners (rotating around).
- 
-    Returns: list of Robot instances
-    """
-    rows = len(grid)
-    cols = len(grid[0])
- 
-    corners = [(0, 0), (0, cols - 1), (rows - 1, 0), (rows - 1, cols - 1)]
- 
-    return [Robot(i + 1, *corners[i % 4]) for i in range(num_robots)]
 
+# ── Terrain functions ─────────────────────────────────────────────────────────
 def make_grid(rows, cols):
-    """
-    Return a rows×cols grid, initially all EMPTY.
-    """
+    '''
+    make_grid - creates an empty warehouse grid (all EMPTY cells).
+
+    rows - number of rows (int)
+    cols - number of columns (int)
+
+    Returns a rows x cols list of lists filled with EMPTY.
+    '''
     return [[EMPTY] * cols for _ in range(rows)]
 
-def add_shelves(grid):
-    """
-    Place shelves in the grid.
-    Keep outer border, 4 corners always EMPTY.
-    """
-    grid = np.array(grid)  # Convert to NumPy array for easier slicing
-    rows, cols = grid.shape
-    
-    grid[1:-1, 1:-1:2] = SHELF # Place shelves in odd columns (1, 3, 5, ...)
-    grid[rows//2, :] = EMPTY # Clear the middle row for a way
-    return grid
 
-def reachable_shelf_cells(grid):
-    """
-    Return a list of SHELF cells that are reachable by a robot,
-    i.e., have at least one adjacent EMPTY cell (where the robot can stand to pick up the good).
-    """
-    rows = len(grid)
-    cols = len(grid[0])
-    result = []
+def add_shelves(grid):
+    '''
+    add_shelves - populates the grid with a structured shelf layout.
+    Pattern: alternating shelf columns and aisle columns.
+              - Even-indexed interior columns --> SHELF
+              - Odd-indexed interior columns  --> EMPTY (aisle)
+    Border rows/columns and the four corners are always kept EMPTY.
+
+    grid - warehouse grid to modify in-place (list of lists)
+    '''
+    rows    = len(grid)
+    cols    = len(grid[0])
+    corners = {(0, 0), (0, cols-1), (rows-1, 0), (rows-1, cols-1)}
 
     for r in range(rows):
         for c in range(cols):
+            if (r, c) in corners:
+                continue
+            if r == 0 or r == rows - 1 or c == 0 or c == cols - 1:
+                continue
+            if c % 2 == 0:
+                grid[r][c] = SHELF
+
+
+def load_map_csv(filepath):
+    '''
+    load_map_csv - reads warehouse terrain from a CSV file.
+    Each cell value must be 0 (EMPTY) or 1 (SHELF).
+
+    filepath - path to the CSV file (str)
+
+    Returns the grid as a list of lists of ints.
+    '''
+    with open(filepath, newline="", encoding="utf-8") as f:
+        grid = [[int(v) for v in row] for row in csv.reader(f) if row]
+    return grid
+
+
+def save_map_csv(grid, filepath):
+    '''
+    save_map_csv - writes the current terrain grid to a CSV file.
+    Useful for reusing a generated map in batch mode.
+
+    grid     - warehouse grid (list of lists)
+    filepath - destination file path (str)
+    '''
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for row in grid:
+            writer.writerow(row)
+    print(f"Map saved to: {filepath}")
+
+
+def reachable_shelf_cells(grid):
+    '''
+    reachable_shelf_cells - finds all shelf cells that a robot can reach.
+    A shelf cell is reachable if at least one adjacent cell is EMPTY.
+
+    grid - warehouse grid (list of lists)
+
+    Returns a list of (row, col) tuples for valid good placement.
+    '''
+    rows   = len(grid)
+    cols   = len(grid[0])
+    result = []
+    for r in range(rows):
+        for c in range(cols):
             if grid[r][c] != SHELF:
-                continue   # Chỉ xét ô kệ
-            # Kiểm tra 4 ô xung quanh có ô lối đi không
+                continue
             for dr, dc in DIRECTIONS:
                 nr, nc = r + dr, c + dc
-                if (0 <= nr < rows and 0 <= nc < cols
-                        and grid[nr][nc] == EMPTY):
+                if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == EMPTY:
                     result.append((r, c))
-                    break   # Có 1 ô lối đi cạnh là đủ
-
+                    break
     return result
- 
-# ── MỚI: Tạo danh sách hàng hóa ─────────────────────────────────────────────
+
+
+def make_robots(grid, num_robots):
+    '''
+    make_robots - spawns robots at the four grid corners.
+    If num_robots > 4, additional robots cycle through the corners.
+
+    grid       - warehouse grid (list of lists)
+    num_robots - number of robots to create (int)
+
+    Returns a list of Robot objects.
+    '''
+    rows    = len(grid)
+    cols    = len(grid[0])
+    corners = [(0, 0), (0, cols-1), (rows-1, 0), (rows-1, cols-1)]
+    return [Robot(i + 1, *corners[i % 4], grid) for i in range(num_robots)]
+
+
 def make_goods(grid, num_goods):
-    """
-    Đặt num_goods kiện hàng lên các ô KỆ có thể tiếp cận được.
-    Nhiều hàng có thể cùng ô (đề bài cho phép).
-    """
+    '''
+    make_goods - places goods on reachable shelf cells at random.
+    Multiple goods may share the same shelf cell (as per specification).
+
+    grid      - warehouse grid (list of lists)
+    num_goods - number of Good objects to create (int)
+
+    Returns a list of Good objects.
+    '''
     candidates = reachable_shelf_cells(grid)
- 
     if not candidates:
-        print("Cảnh báo: Không có ô kệ hợp lệ để đặt hàng!")
+        print("Warning: no reachable shelf cells found for good placement.")
         return []
     return [Good(*random.choice(candidates)) for _ in range(num_goods)]
 
-def draw_grid(grid, robots, goods):
-    """
-    Display the grid: EMPTY cells = white, SHELF cells = gray.
-    """
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Simulation loop + statistics (4 subplots)
+# ══════════════════════════════════════════════════════════════════════════════
+def run_simulation(grid, robots, goods,
+                   max_steps=120, step_delay=0.25, spawn_prob=0.0):
+    '''
+    run_simulation - main simulation loop with live visualisation.
+
+    Four subplots are displayed:
+      Top-left     : warehouse map with robots, goods, and paths
+      Top-right    : cumulative goods delivered over time
+      Bottom-left  : throughput (goods delivered per 5 steps)
+      Bottom-right : goods remaining vs idle robots over time
+
+    grid       - warehouse grid (list of lists)
+    robots     - list of Robot objects (list)
+    goods      - list of Good objects; modified in-place (list)
+    max_steps  - maximum number of timesteps to run (int)
+    step_delay - pause duration between frames in seconds (float)
+    spawn_prob - probability of a new good appearing each step (float)
+    '''
     rows = len(grid)
     cols = len(grid[0])
 
-    img = np.ones((rows, cols, 3)) # Create an RGB image starting all EMPTY
+    # Per-timestep statistics
+    history_delivered  = []   # cumulative goods delivered
+    history_remaining  = []   # goods still in the warehouse
+    history_idle       = []   # number of idle robots
+    history_throughput = []   # goods delivered per 5-step window
+
+    # Heatmap: counts how many times each cell is visited by any robot
+    heatmap    = np.zeros((rows, cols), dtype=float)
+    candidates = reachable_shelf_cells(grid)
+    prev_total = 0
+
+    plt.ion()
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle("Robotic Warehouse Simulation", fontsize=14, fontweight="bold")
+    plt.tight_layout(pad=2.5)
+
+    for step in range(1, max_steps + 1):
+
+        # 1. Update all robots
+        for robot in robots:
+            robot.step_change(goods)
+            heatmap[robot.row, robot.col] += 1
+
+        # 2. Randomly spawn a new good (if enabled)
+        if spawn_prob > 0 and random.random() < spawn_prob and candidates:
+            goods.append(Good(*random.choice(candidates)))
+
+        # 3. Record statistics
+        total_delivered = sum(r.goods_delivered for r in robots)
+        num_idle        = sum(1 for r in robots if r.state == STATE_IDLE)
+        history_delivered.append(total_delivered)
+        history_remaining.append(len(goods))
+        history_idle.append(num_idle)
+
+        if step % 5 == 0:
+            history_throughput.append(total_delivered - prev_total)
+            prev_total = total_delivered
+
+        # 4. Draw frame
+        _draw_frame(fig, axes, grid, robots, goods,
+                    history_delivered, history_remaining,
+                    history_idle, history_throughput, heatmap, step)
+        plt.pause(step_delay)
+
+        # 5. Early exit: all goods collected and no more will spawn
+        if not goods and spawn_prob == 0 and num_idle == len(robots):
+            print(f"\nAll goods collected after {step} steps.")
+            break
+
+    plt.ioff()
+    _draw_frame(fig, axes, grid, robots, goods,
+                history_delivered, history_remaining,
+                history_idle, history_throughput, heatmap, step)
+    fig.suptitle(
+        f"Complete  –  {sum(r.goods_delivered for r in robots)} goods "
+        f"delivered in {step} steps",
+        fontsize=13, fontweight="bold"
+    )
+    print_summary(robots, step)
+    plt.show()
+
+
+def _draw_frame(fig, axes, grid, robots, goods,
+                hist_del, hist_rem, hist_idle,
+                hist_throughput, heatmap, step):
+    '''
+    _draw_frame - redraws all four subplots for the current timestep.
+
+    fig              - matplotlib Figure object
+    axes             - 2x2 array of Axes objects
+    grid             - warehouse grid (list of lists)
+    robots           - list of Robot objects (list)
+    goods            - list of Good objects (list)
+    hist_del         - cumulative deliveries per step (list)
+    hist_rem         - goods remaining per step (list)
+    hist_idle        - idle robot count per step (list)
+    hist_throughput  - deliveries per 5-step window (list)
+    heatmap          - visit-count array, shape (rows, cols) (np.ndarray)
+    step             - current timestep number (int)
+    '''
+    ax_map  = axes[0, 0]
+    ax_del  = axes[0, 1]
+    ax_tp   = axes[1, 0]
+    ax_stat = axes[1, 1]
+    rows = len(grid)
+    cols = len(grid[0])
+
+    # ── Top-left: warehouse map ───────────────────────────────────────────────
+    ax_map.cla()
+    img = np.ones((rows, cols, 3))
 
     for r in range(rows):
         for c in range(cols):
             if grid[r][c] == SHELF:
-                img[r, c] = [0.4, 0.4, 0.4]   # Grey = shelf
+                img[r, c] = [0.40, 0.40, 0.40]   # dark grey = shelf
 
-    corners = [(0,0), (0,cols-1), (rows-1,0), (rows-1,cols-1)] # 4 corners for robot home
-    for r, c in corners:
-        img[r, c] = [0.7, 0.9, 0.7]   # Light green for corners (robot home)
+    for r, c in [(0,0),(0,cols-1),(rows-1,0),(rows-1,cols-1)]:
+        img[r, c] = [0.72, 0.93, 0.72]            # light green = home corner
 
-    # Ô kệ có hàng → vàng; ô kệ có ≥2 hàng → cam đậm hơn
-    from collections import Counter
-    good_count = Counter((g.row, g.col) for g in goods)
-    for (r, c), count in good_count.items():
-        if count == 1:
-            img[r, c] = [1.0, 0.85, 0.0]    # Vàng = 1 kiện
-        else:
-            img[r, c] = [1.0, 0.55, 0.0]    # Cam = nhiều kiện
- 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.imshow(img, interpolation="nearest", aspect="equal")
-    
-    # Số lượng kiện trên ô có nhiều hơn 1
-    for (r, c), count in good_count.items():
-        if count > 1:
-            ax.text(c, r, str(count), ha="center", va="center",
-                    fontsize=7, color="black", fontweight="bold", zorder=6)
-    
-    # Draw robots in round circles with their ID
+    for good in goods:
+        img[good.row, good.col] = [1.0, 0.84, 0.0]   # gold = 1 good
+
+    for pos, n in Counter((g.row, g.col) for g in goods).items():
+        if n > 1:
+            img[pos[0], pos[1]] = [1.0, 0.55, 0.0]   # orange = multiple goods
+
+    ax_map.imshow(img, interpolation="nearest", aspect="equal")
+
+    # Draw planned paths (faint lines)
+    for robot in robots:
+        if robot.path:
+            colour = ROBOT_COLOURS[(robot.robot_id - 1) % len(ROBOT_COLOURS)]
+            pr = [robot.row] + [p[0] for p in robot.path]
+            pc = [robot.col] + [p[1] for p in robot.path]
+            ax_map.plot(pc, pr, "-", color=colour, alpha=0.25, linewidth=1.5)
+
+    # Draw robots
     for robot in robots:
         colour = ROBOT_COLOURS[(robot.robot_id - 1) % len(ROBOT_COLOURS)]
-        ax.plot(robot.col, robot.row, "o", color=colour, markersize=14, zorder=5)
-        ax.text(robot.col, robot.row, str(robot.robot_id), color="white",
-                fontsize=8, ha="center", va="center", zorder=6)
-    
-    # Set grid lines
-    ax.set_xticks(np.arange(-0.5, cols, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, rows, 1), minor=True)
-    ax.grid(which="minor", color="lightgray", linewidth=0.5)
-    ax.tick_params(which="minor", length=0)
-    
-    # Set ticks and labels
-    ax.set_xticks(np.arange(cols))
-    ax.set_yticks(np.arange(rows))
-    ax.set_xticklabels(np.arange(1, cols + 1))
-    ax.set_yticklabels(np.arange(1, rows + 1))
- 
-    # Add legend
+        marker = "^" if robot.carrying else "o"   # triangle = carrying good
+        ax_map.plot(robot.col, robot.row, marker, color=colour,
+                    markersize=13, zorder=5)
+        ax_map.text(robot.col, robot.row, str(robot.robot_id),
+                    ha="center", va="center",
+                    fontsize=7, color="white", fontweight="bold", zorder=6)
+
+    ax_map.set_xticks(np.arange(-0.5, cols, 1), minor=True)
+    ax_map.set_yticks(np.arange(-0.5, rows, 1), minor=True)
+    ax_map.grid(which="minor", color="lightgray", linewidth=0.5)
+    ax_map.tick_params(which="minor", length=0)
+    ax_map.set_title(
+        f"Step {step}  |  Remaining: {len(goods)}  |  Delivered: {hist_del[-1]}",
+        fontsize=10
+    )
     legend = [
-        mpatches.Patch(color=[1,1,1], label="Way (EMPTY)"),
-        mpatches.Patch(color=[0.4,0.4,0.4], label="Shelf (SHELF)"),
-        mpatches.Patch(color=[0.7,0.9,0.7], label="Corner - robot home"),
-        mpatches.Patch(color=[1.0,0.85,0.0],  label="Kệ có 1 kiện"),
-        mpatches.Patch(color=[1.0,0.55,0.0],  label="Kệ có nhiều kiện"),
+        mpatches.Patch(color=[0.40,0.40,0.40], label="Shelf"),
+        mpatches.Patch(color=[1.0,0.84,0.0],   label="Good (1 item)"),
+        mpatches.Patch(color=[1.0,0.55,0.0],   label="Good (multiple)"),
+        mpatches.Patch(color=[0.72,0.93,0.72],  label="Home corner"),
         plt.Line2D([0],[0], marker="o", color="w",
-                   markerfacecolor="#e74c3c", markersize=10, label="Robot")
+                   markerfacecolor="#e74c3c", markersize=9, label="Robot"),
+        plt.Line2D([0],[0], marker="^", color="w",
+                   markerfacecolor="#e74c3c", markersize=9, label="Carrying"),
     ]
-    ax.legend(handles=legend, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-    plt.tight_layout()
-    plt.show()
+    ax_map.legend(handles=legend, loc="upper right", fontsize=7, framealpha=0.9)
 
-def demo_availability(goods, robots):
-    """
-    Mô phỏng trả lời Prompt 3:
-    'How will the system update when one robot takes an item
-     before another robot arrives?'
-    """
-    print("=" * 50)
-    print("DEMO: Cơ chế đặt chỗ (available)")
-    print("=" * 50)
+    x = list(range(1, len(hist_del) + 1))
 
-    # Robot 1 tìm hàng gần nhất
-    r1 = robots[0]
-    target1 = find_nearest_good(goods, r1.row, r1.col)
-    if target1:
-        print(f"\nRobot 1 @ ({r1.row},{r1.col}) chọn: {target1}")
-        target1.available = False   # Đặt chỗ ngay lập tức
-        print(f"  → Sau khi đặt chỗ: available = {target1.available}")
+    # ── Top-right: cumulative deliveries ─────────────────────────────────────
+    ax_del.cla()
+    ax_del.plot(x, hist_del, color="#2ecc71", linewidth=2, label="Delivered")
+    ax_del.fill_between(x, hist_del, alpha=0.2, color="#2ecc71")
+    if hist_del:
+        ideal = [hist_del[-1] / len(hist_del) * i for i in range(1, len(x)+1)]
+        ax_del.plot(x, ideal, color="gray", linewidth=1,
+                    linestyle=":", label="Ideal rate")
+        ax_del.legend(fontsize=8)
+    ax_del.set_title("Cumulative Deliveries", fontsize=10)
+    ax_del.set_xlabel("Timestep")
+    ax_del.set_ylabel("Goods delivered")
+    ax_del.set_xlim(left=1)
+    ax_del.set_ylim(bottom=0)
+    ax_del.grid(True, alpha=0.3)
 
-    # Robot 2 tìm hàng — cùng ô kệ đó vẫn có thể có kiện khác
-    r2 = robots[1]
-    target2 = find_nearest_good(goods, r2.row, r2.col)
-    if target2:
-        print(f"\nRobot 2 @ ({r2.row},{r2.col}) chọn: {target2}")
-        if target2 is target1:
-            print("  ❌ Lỗi: cùng kiện!")
-        else:
-            print("  ✓ Kiện khác, không xung đột")
-        target2.available = False
- 
-    # Kiểm tra trạng thái kệ (3 kiện cùng ô)
-    print("\n--- Trạng thái tất cả goods ---")
-    for g in goods[:8]:
-        print(f"  {g}")
-    print("=" * 50)
-    
+    # ── Bottom-left: throughput per 5-step window ─────────────────────────────
+    ax_tp.cla()
+    if hist_throughput:
+        tp_x = [i * 5 for i in range(1, len(hist_throughput) + 1)]
+        ax_tp.bar(tp_x, hist_throughput, width=4, color="#9b59b6", alpha=0.75)
+        avg = sum(hist_throughput) / len(hist_throughput)
+        ax_tp.axhline(avg, color="#e74c3c", linewidth=1.5,
+                      linestyle="--", label=f"Avg = {avg:.1f}")
+        ax_tp.legend(fontsize=8)
+    ax_tp.set_title("Throughput (goods per 5 steps)", fontsize=10)
+    ax_tp.set_xlabel("Timestep")
+    ax_tp.set_ylabel("Goods delivered")
+    ax_tp.set_xlim(left=0)
+    ax_tp.set_ylim(bottom=0)
+    ax_tp.grid(True, alpha=0.3)
+
+    # ── Bottom-right: goods remaining + idle robots ───────────────────────────
+    ax_stat.cla()
+    ax_stat.plot(x, hist_rem,  color="#e74c3c", linewidth=2,
+                 label="Goods remaining")
+    ax_stat.plot(x, hist_idle, color="#3498db", linewidth=2,
+                 linestyle="--", label="Idle robots")
+    ax_stat.set_title("Goods Remaining & Idle Robots", fontsize=10)
+    ax_stat.set_xlabel("Timestep")
+    ax_stat.set_ylabel("Count")
+    ax_stat.set_xlim(left=1)
+    ax_stat.set_ylim(bottom=0)
+    ax_stat.legend(fontsize=9)
+    ax_stat.grid(True, alpha=0.3)
+
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Interactive mode  (-i)
+# ══════════════════════════════════════════════════════════════════════════════
+def prompt_int(msg, lo, hi, default):
+    '''
+    prompt_int - prompts the user for an integer within [lo, hi].
+    Press Enter to accept the default value.
+
+    msg     - prompt message (str)
+    lo      - minimum accepted value (int)
+    hi      - maximum accepted value (int)
+    default - value returned when the user presses Enter (int)
+    '''
+    while True:
+        raw = input(f"  {msg} [{default}]: ").strip()
+        if raw == "":
+            return default
+        try:
+            v = int(raw)
+            if lo <= v <= hi:
+                return v
+            print(f"    Please enter a number between {lo} and {hi}.")
+        except ValueError:
+            print("    Please enter a whole number.")
+
+
+def prompt_float(msg, lo, hi, default):
+    '''
+    prompt_float - prompts the user for a float within [lo, hi].
+    Press Enter to accept the default value.
+
+    msg     - prompt message (str)
+    lo      - minimum accepted value (float)
+    hi      - maximum accepted value (float)
+    default - value returned when the user presses Enter (float)
+    '''
+    while True:
+        raw = input(f"  {msg} [{default}]: ").strip()
+        if raw == "":
+            return default
+        try:
+            v = float(raw)
+            if lo <= v <= hi:
+                return v
+            print(f"    Please enter a number between {lo} and {hi}.")
+        except ValueError:
+            print("    Please enter a decimal number.")
+
+
+def interactive_setup():
+    '''
+    interactive_setup - prompts the user for all simulation parameters.
+    Returns (grid, robots, goods, params).
+    Run with: python3 warehouse.py -i
+    '''
+    print("\n" + "=" * 52)
+    print("  WAREHOUSE SIMULATION  –  Interactive Setup")
+    print("=" * 52)
+
+    rows       = prompt_int("Grid rows (5-50)",              5,   50,  12)
+    cols       = prompt_int("Grid columns (5-50)",           5,   50,  14)
+    num_robots = prompt_int("Number of robots (1-8)",        1,    8,   4)
+    num_goods  = prompt_int("Initial number of goods",       1,  200,  12)
+    max_steps  = prompt_int("Simulation length (steps)",     1, 2000, 120)
+    spawn_prob = prompt_float("Good spawn probability per step (0-1)",
+                              0.0, 1.0, 0.0)
+    step_delay = prompt_float("Animation delay per frame (seconds)",
+                              0.0, 5.0, 0.25)
+
+    grid   = make_grid(rows, cols)
+    add_shelves(grid)
+    robots = make_robots(grid, num_robots)
+    goods  = make_goods(grid, num_goods)
+
+    params = {
+        "max_steps":  max_steps,
+        "spawn_prob": spawn_prob,
+        "step_delay": step_delay,
+    }
+    return grid, robots, goods, params
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Batch mode  (-f map.csv -p params.csv)
+# ══════════════════════════════════════════════════════════════════════════════
+def load_params_csv(filepath):
+    '''
+    load_params_csv - reads simulation parameters from a key-value CSV file.
+    Expected format (one parameter per row):
+        num_robots,4
+        num_goods,12
+        max_steps,120
+        spawn_probability,0.05
+        step_delay,0.25
+    Values are automatically cast to int or float where possible.
+
+    filepath - path to the parameters CSV file (str)
+
+    Returns a dict mapping parameter names to values.
+    '''
+    params = {}
+    with open(filepath, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if len(row) >= 2:
+                key = row[0].strip()
+                val = row[1].strip()
+                try:
+                    params[key] = int(val)
+                except ValueError:
+                    try:
+                        params[key] = float(val)
+                    except ValueError:
+                        params[key] = val
+    return params
+
+
+def batch_setup(map_file, params_file):
+    '''
+    batch_setup - loads terrain and parameters from CSV files.
+    Falls back to a default 12x14 grid and default parameters if either
+    file is missing or contains invalid data.
+    Run with: python3 warehouse.py -f map1.csv -p params1.csv
+
+    map_file    - path to the warehouse terrain CSV (str)
+    params_file - path to the simulation parameters CSV (str)
+
+    Returns (grid, robots, goods, params).
+    '''
+    try:
+        grid = load_map_csv(map_file)
+        if not grid or not grid[0]:
+            raise ValueError("Map file is empty.")
+    except FileNotFoundError:
+        print(f"Warning: '{map_file}' not found – using default 12x14 grid.")
+        grid = make_grid(12, 14)
+        add_shelves(grid)
+    except Exception as e:
+        print(f"Warning: could not read map ({e}) – using default grid.")
+        grid = make_grid(12, 14)
+        add_shelves(grid)
+
+    try:
+        params = load_params_csv(params_file)
+    except FileNotFoundError:
+        print(f"Warning: '{params_file}' not found – using default parameters.")
+        params = {}
+    except Exception as e:
+        print(f"Warning: could not read parameters ({e}) – using defaults.")
+        params = {}
+
+    num_robots = int(params.get("num_robots",   4))
+    num_goods  = int(params.get("num_goods",   12))
+
+    robots = make_robots(grid, num_robots)
+    goods  = make_goods(grid, num_goods)
+
+    sim_params = {
+        "max_steps":  int(params.get("max_steps",          120)),
+        "spawn_prob": float(params.get("spawn_probability", 0.0)),
+        "step_delay": float(params.get("step_delay",        0.25)),
+    }
+    return grid, robots, goods, sim_params
+
+
+# ── Summary statistics ────────────────────────────────────────────────────────
+def print_summary(robots, total_steps):
+    '''
+    print_summary - prints a formatted results table to the console.
+
+    robots      - list of Robot objects (list)
+    total_steps - number of timesteps the simulation ran (int)
+    '''
+    total = sum(r.goods_delivered for r in robots)
+    total_steps_all = sum(r.steps_taken for r in robots)
+
+    print("\n" + "=" * 54)
+    print("  SIMULATION RESULTS")
+    print("=" * 54)
+    print(f"  Total steps          : {total_steps}")
+    print(f"  Total goods delivered: {total}")
+    print(f"  Avg throughput       : {total / total_steps * 10:.2f} goods / 10 steps")
+    print(f"  Total robot steps    : {total_steps_all}")
+    print(f"  Avg steps per item   : {total_steps_all / max(total, 1):.1f}")
+    print()
+    print(f"  {'Robot':<8} {'Delivered':>9} {'Steps':>6} "
+          f"{'Idle':>6} {'Efficiency':>11}")
+    print(f"  {'-' * 44}")
+    for r in robots:
+        eff = r.goods_delivered / max(r.steps_taken, 1) * 100
+        print(f"  Robot {r.robot_id:<3} {r.goods_delivered:>9} "
+              f"{r.steps_taken:>6} {r.idle_steps:>6} {eff:>10.1f}%")
+    print("=" * 54)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+def build_parser():
+    '''
+    build_parser - constructs the command-line argument parser.
+    Returns an argparse.ArgumentParser.
+    '''
+    parser = argparse.ArgumentParser(
+        description="Robotic Warehouse Simulation – COMP1005/5005",
+        epilog=(
+            "Examples:\n"
+            "  python3 warehouse.py -i\n"
+            "  python3 warehouse.py -i --save-map my_map.csv\n"
+            "  python3 warehouse.py -f map1.csv -p params1.csv\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("-i", "--interactive", action="store_true",
+                      help="Interactive mode: prompts for all parameters.")
+    mode.add_argument("-f", "--map-file", metavar="MAP.csv",
+                      help="Batch mode: warehouse terrain CSV file.")
+    parser.add_argument("-p", "--params-file", metavar="PARAMS.csv",
+                        help="Batch mode: simulation parameters CSV (required with -f).")
+    parser.add_argument("--save-map", metavar="OUTPUT.csv",
+                        help="Save the generated/loaded map to a CSV file.")
+    return parser
+
+
+def main():
+    '''
+    main - parses command-line arguments, sets up the simulation, and runs it.
+    '''
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    if args.interactive:
+        grid, robots, goods, params = interactive_setup()
+    else:
+        if not args.params_file:
+            parser.error("-p / --params-file is required when using -f / --map-file.")
+        grid, robots, goods, params = batch_setup(args.map_file, args.params_file)
+
+    if args.save_map:
+        save_map_csv(grid, args.save_map)
+
+    print(f"\nStarting: {len(robots)} robot(s), {len(goods)} goods, "
+          f"grid {len(grid)}x{len(grid[0])}")
+
+    run_simulation(
+        grid,
+        robots,
+        goods,
+        max_steps  = params["max_steps"],
+        step_delay = params["step_delay"],
+        spawn_prob = params["spawn_prob"],
+    )
+
+
 if __name__ == "__main__":
-    random.seed(42)
-    
-    ROWS = 12
-    COLS = 14
-    NUM_ROBOTS = 4
-    NUM_GOODS  = 15
- 
-    grid = make_grid(ROWS, COLS)
-    grid = add_shelves(grid)
-    robots = make_robots(grid, NUM_ROBOTS)
-    goods  = make_goods(grid, NUM_GOODS)
-    # Thống kê ô bị trùng
-    from collections import Counter
-    counts = Counter((g.row, g.col) for g in goods)
-    multi  = {pos: n for pos, n in counts.items() if n > 1}
- 
-    print(f"Tổng kiện hàng  : {len(goods)}")
-    print(f"Ô kệ có hàng    : {len(counts)}")
-    print(f"Ô có nhiều kiện : {len(multi)}")
-    for pos, n in multi.items():
-        print(f"  Kệ {pos} → {n} kiện")
- 
-    print("\n=== Bản đồ (G=1 kiện, 2G=2 kiện...) ===")
- 
-    demo_availability(goods, robots)
- 
-    draw_grid(grid, robots, goods)
+    main()
