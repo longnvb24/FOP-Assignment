@@ -1,5 +1,5 @@
 """
-warehouse.py  –  Robotic Warehouse Simulation
+warehouse.py  -  Robotic Warehouse Simulation
 ==============================================
 Simulates autonomous robots collecting goods from shelf locations
 and returning them to their home corners in a grid-based environment.
@@ -12,9 +12,8 @@ Save map    : python3 warehouse.py -i --save-map my_map.csv
 """
 
 import argparse
-import csv
 import random
-from collections import deque, Counter
+from collections import Counter
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -24,7 +23,7 @@ import matplotlib.patches as mpatches
 EMPTY = 0   # Walkable aisle cell
 SHELF = 1   # Impassable shelf cell
 
-# Robot state labels 
+# Robot state labels
 STATE_IDLE      = "idle"             # No current task
 STATE_MOVING    = "moving_to_good"   # Travelling toward a target good
 STATE_RETURNING = "returning"        # Carrying a good back to home corner
@@ -134,70 +133,58 @@ class Robot:
 
     def assign_target(self, goods):
         '''
-        assign_target - finds the nearest available good and reserves it.
-        Transitions state from idle -> moving_to_good.
+        assign_target - determines the nearest available good and path
 
         goods - list of all Good objects (list)
         '''
-        target = find_nearest_good(goods, self.row, self.col)
+        target = find_nearest_good(goods, self.row, self.col) # find the closest available good
         if target is None:
             self.idle_steps += 1
             return
 
-        pickup = get_pickup_cells(self.grid, target)
-        path   = bfs(self.grid, self.row, self.col, pickup)
+        pickup = get_pickup_cells(self.grid, target) # get the valid pickup cells for this target
+        path   = bfs(self.grid, self.row, self.col, pickup) # find the shortest path to this pickup cell
 
-        if not path and (self.row, self.col) not in set(pickup):
+        if not path and (self.row, self.col) not in set(pickup): # if no path and pickup cell exists, remain idle
             self.idle_steps += 1
             return
 
         target.available = False   # reserve immediately; prevents other robots claiming it
         self.target_good = target
         self.path        = path
-        self.state       = STATE_MOVING
+        self.state       = STATE_MOVING # transition to moving state
 
     def check_pickup(self, goods):
         '''
         check_pickup - checks whether the robot has reached a pickup cell.
-        If the target good has disappeared (taken by another robot before
-        arrival), the robot retargets automatically.
-        Transitions state from moving_to_good --> returning on success.
 
         goods - list of all Good objects (list)
         '''
-        if not self.target_good:
+        if not self.target_good: # if no target, reset to idle
             self.state = STATE_IDLE
             return
 
-        # Retarget if the good was removed before this robot arrived
-        if self.target_good not in goods:
+        if self.target_good not in goods: # retarget if the good was removed before this robot arrived
             self.target_good = None
             self.path        = []
             self.state       = STATE_IDLE
             return
 
-        pickup = set(get_pickup_cells(self.grid, self.target_good))
-        if (self.row, self.col) in pickup and not self.path:
-            goods.remove(self.target_good)
-            self.carrying    = True
-            self.target_good = None
-            self.state       = STATE_RETURNING
-            self.path        = bfs(self.grid, self.row, self.col,
-                                   [(self.home_row, self.home_col)])
+        pickup = set(get_pickup_cells(self.grid, self.target_good)) # get the valid pickup cells for this target
+        if (self.row, self.col) in pickup and not self.path: # if currently on a pickup cell and path is empty, pick up the good and plan return path
+            goods.remove(self.target_good) # remove the good from the warehouse
+            self.carrying    = True # mark the robot as now carrying a good
+            self.target_good = None # clear the target good reference
+            self.state       = STATE_RETURNING # transition to returning state
+            self.path        = bfs(self.grid, self.row, self.col, 
+                                   [(self.home_row, self.home_col)]) # plan path back to home
 
-    def __repr__(self):
-        return (f"Robot({self.robot_id}) @ ({self.row},{self.col}) "
-                f"state={self.state} delivered={self.goods_delivered}")
-
-
-# ── Pathfinding helpers ───────────────────────────────────────────────────────
 def get_pickup_cells(grid, good):
     '''
-    get_pickup_cells - returns all EMPTY cells directly adjacent to a shelf cell.
-    These are the positions a robot must stand on to collect the good.
+    get_pickup_cells - returns all EMPTY cells near shelf cell, where the robot can pick up the good.
 
     grid - warehouse grid (list of lists)
-    good - the Good object whose shelf location is queried (Good)
+    good - the Good object
     '''
     rows = len(grid)
     cols = len(grid[0])
@@ -208,44 +195,41 @@ def get_pickup_cells(grid, good):
             and grid[good.row + dr][good.col + dc] == EMPTY)
     ]
 
-
 def bfs(grid, sr, sc, goals):
     '''
-    bfs - Breadth-First Search shortest path on the warehouse grid.
-    Shelf cells are treated as impassable walls.
-
-    grid  - warehouse grid (list of lists)
-    sr    - start row (int)
-    sc    - start column (int)
-    goals - set of destination (row, col) tuples (list or set)
-
-    Returns list of (row, col) waypoints from start to goal (exclusive start,
-    inclusive goal). Returns [] if already at a goal or no path exists.
+    bfs - find the shortest path from (sr, sc) to any of the goal cells using Breadth-First Search.
+    Returns a list of steps [(row, col), ...], or [] if no path exists.
     '''
     rows  = len(grid)
     cols  = len(grid[0])
     goals = set(goals)
-    start = (sr, sc)
 
-    if start in goals:
+    if (sr, sc) in goals: # if already on a goal cell, return empty path
         return []
 
-    queue   = deque([(start, [])])
-    visited = {start}
+    queue = [(sr, sc, [])] # queue of (current_row, current_col, path)
 
-    while queue:
-        (r, c), path = queue.popleft()
-        for dr, dc in DIRECTIONS:
-            nr, nc = r + dr, c + dc
-            if not (0 <= nr < rows and 0 <= nc < cols):
-                continue
-            if (nr, nc) in visited or grid[nr][nc] == SHELF:
-                continue
-            new_path = path + [(nr, nc)]
-            if (nr, nc) in goals:
-                return new_path
-            visited.add((nr, nc))
-            queue.append(((nr, nc), new_path))
+    visited = set()
+    visited.add((sr, sc)) # mark the starting cell as visited
+
+    while len(queue) > 0:
+        current_row, current_col, path = queue.pop(0)
+
+        for dr, dc in DIRECTIONS: # check all four directions
+            next_row = current_row + dr
+            next_col = current_col + dc
+
+            if (0 <= next_row < rows) and (0 <= next_col < cols) \
+                and (next_row, next_col) not in visited \
+                and grid[next_row][next_col] != SHELF:
+                new_path = path + [(next_row, next_col)] # concatenate new cells to the path
+
+                if (next_row, next_col) in goals: # if reached a goal cell, return the path to it
+                    return new_path
+
+                visited.add((next_row, next_col)) # mark cell as visited
+                queue.append((next_row, next_col, new_path)) # add cell to the queue
+
     return []
 
 
@@ -256,157 +240,137 @@ def find_nearest_good(goods, robot_row, robot_col):
     goods      - list of all Good objects (list)
     robot_row  - current row of the robot (int)
     robot_col  - current column of the robot (int)
-
-    Returns the closest Good with available=True, or None if none exist.
     '''
-    best      = None
-    best_dist = float("inf")
+    nearest      = None
+    nearest_dist = float("inf")
+
     for good in goods:
-        if not good.available:
-            continue
-        dist = abs(good.row - robot_row) + abs(good.col - robot_col)
-        if dist < best_dist:
-            best_dist = dist
-            best      = good
-    return best
+        if good.available: # just find the available goods
+            dist = abs(good.row - robot_row) + abs(good.col - robot_col)
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest      = good
+    return nearest
 
 
-# ── Terrain functions ─────────────────────────────────────────────────────────
 def make_grid(rows, cols):
     '''
-    make_grid - creates an empty warehouse grid (all EMPTY cells).
+    make_grid - creates an empty warehouse
 
     rows - number of rows (int)
     cols - number of columns (int)
-
-    Returns a rows x cols list of lists filled with EMPTY.
     '''
     return [[EMPTY] * cols for _ in range(rows)]
 
 
 def add_shelves(grid):
     '''
-    add_shelves - populates the grid with a structured shelf layout.
-    Pattern: alternating shelf columns and aisle columns.
-              - Even-indexed interior columns --> SHELF
-              - Odd-indexed interior columns  --> EMPTY (aisle)
-    Border rows/columns and the four corners are always kept EMPTY.
+    add_shelves - populates the grid with a structured shelf layout as supermarkets have.
 
     grid - warehouse grid to modify in-place (list of lists)
     '''
     rows    = len(grid)
     cols    = len(grid[0])
-    corners = {(0, 0), (0, cols-1), (rows-1, 0), (rows-1, cols-1)}
 
-    for r in range(rows):
-        for c in range(cols):
-            if (r, c) in corners:
-                continue
-            if r == 0 or r == rows - 1 or c == 0 or c == cols - 1:
-                continue
-            if c % 2 == 0:
+    for r in range(1, rows-1):
+        for c in range(1, cols-1):
+            if c % 2 == 1:
                 grid[r][c] = SHELF
-
 
 def load_map_csv(filepath):
     '''
     load_map_csv - reads warehouse terrain from a CSV file.
-    Each cell value must be 0 (EMPTY) or 1 (SHELF).
 
     filepath - path to the CSV file (str)
-
-    Returns the grid as a list of lists of ints.
     '''
-    with open(filepath, newline="", encoding="utf-8") as f:
-        grid = [[int(v) for v in row] for row in csv.reader(f) if row]
-    return grid
-
+    try:
+        with open(filepath, 'r') as f:
+            grid = []
+            for line in f:
+                line = line.strip()
+                line = line.split(",")
+                grid.append([int(v) for v in line])
+        return grid
+    except ValueError as err:
+        print(f"Error: invalid value in map file '{filepath}': {err}")
 
 def save_map_csv(grid, filepath):
     '''
     save_map_csv - writes the current terrain grid to a CSV file.
-    Useful for reusing a generated map in batch mode.
 
     grid     - warehouse grid (list of lists)
     filepath - destination file path (str)
     '''
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with open(filepath, "w") as f:
         for row in grid:
-            writer.writerow(row)
+            line = ",".join(str(cell) for cell in row)
+            f.write(line + "\n")
     print(f"Map saved to: {filepath}")
 
 
 def reachable_shelf_cells(grid):
     '''
     reachable_shelf_cells - finds all shelf cells that a robot can reach.
-    A shelf cell is reachable if at least one adjacent cell is EMPTY.
 
     grid - warehouse grid (list of lists)
-
-    Returns a list of (row, col) tuples for valid good placement.
     '''
     rows   = len(grid)
     cols   = len(grid[0])
     result = []
     for r in range(rows):
         for c in range(cols):
-            if grid[r][c] != SHELF:
-                continue
-            for dr, dc in DIRECTIONS:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == EMPTY:
-                    result.append((r, c))
-                    break
+            if grid[r][c] == SHELF: # only check shelf cells
+                found_empty = False
+                for dr, dc in DIRECTIONS:
+                    if not found_empty:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < rows and 0 <= nc < cols and grid[nr][nc] == EMPTY:
+                            result.append((r, c))
+                            found_empty = True # found at least 1 reachable cell
     return result
 
 
 def make_robots(grid, num_robots):
     '''
-    make_robots - spawns robots at the four grid corners.
-    If num_robots > 4, additional robots cycle through the corners.
+    make_robots - spawns robots at the four grid corners
 
     grid       - warehouse grid (list of lists)
     num_robots - number of robots to create (int)
-
-    Returns a list of Robot objects.
     '''
     rows    = len(grid)
     cols    = len(grid[0])
     corners = [(0, 0), (0, cols-1), (rows-1, 0), (rows-1, cols-1)]
-    return [Robot(i + 1, *corners[i % 4], grid) for i in range(num_robots)]
+    robots = []
+    for i in range(num_robots):
+        r, c = corners[i % 4]
+        robots.append(Robot(i + 1, r, c, grid))
+    return robots
 
 
 def make_goods(grid, num_goods):
     '''
     make_goods - places goods on reachable shelf cells at random.
-    Multiple goods may share the same shelf cell (as per specification).
 
     grid      - warehouse grid (list of lists)
     num_goods - number of Good objects to create (int)
-
-    Returns a list of Good objects.
     '''
     candidates = reachable_shelf_cells(grid)
     if not candidates:
         print("Warning: no reachable shelf cells found for good placement.")
         return []
-    return [Good(*random.choice(candidates)) for _ in range(num_goods)]
+    
+    goods_list = []
+    for i in range(num_goods):
+        chosen_cell = random.choice(candidates)
+        r = chosen_cell[0]
+        c = chosen_cell[1]
+        goods_list.append(Good(r, c))
+    return goods_list
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Simulation loop + statistics (4 subplots)
-# ══════════════════════════════════════════════════════════════════════════════
 def run_simulation(grid, robots, goods,
                    max_steps=120, step_delay=0.25, spawn_prob=0.0):
     '''
     run_simulation - main simulation loop with live visualisation.
-
-    Four subplots are displayed:
-      Top-left     : warehouse map with robots, goods, and paths
-      Top-right    : cumulative goods delivered over time
-      Bottom-left  : throughput (goods delivered per 5 steps)
-      Bottom-right : goods remaining vs idle robots over time
 
     grid       - warehouse grid (list of lists)
     robots     - list of Robot objects (list)
@@ -457,7 +421,7 @@ def run_simulation(grid, robots, goods,
             prev_total = total_delivered
 
         # 4. Draw frame
-        _draw_frame(fig, axes, grid, robots, goods,
+        draw_frame(fig, axes, grid, robots, goods,
                     history_delivered, history_remaining,
                     history_idle, history_throughput, heatmap, step)
         plt.pause(step_delay)
@@ -468,11 +432,11 @@ def run_simulation(grid, robots, goods,
             break
 
     plt.ioff()
-    _draw_frame(fig, axes, grid, robots, goods,
+    draw_frame(fig, axes, grid, robots, goods,
                 history_delivered, history_remaining,
                 history_idle, history_throughput, heatmap, step)
     fig.suptitle(
-        f"Complete  –  {sum(r.goods_delivered for r in robots)} goods "
+        f"Complete  -  {sum(r.goods_delivered for r in robots)} goods "
         f"delivered in {step} steps",
         fontsize=13, fontweight="bold"
     )
@@ -480,11 +444,11 @@ def run_simulation(grid, robots, goods,
     plt.show()
 
 
-def _draw_frame(fig, axes, grid, robots, goods,
+def draw_frame(fig, axes, grid, robots, goods,
                 hist_del, hist_rem, hist_idle,
                 hist_throughput, heatmap, step):
     '''
-    _draw_frame - redraws all four subplots for the current timestep.
+    draw_frame - redraws all four subplots for the current timestep.
 
     fig              - matplotlib Figure object
     axes             - 2x2 array of Axes objects
