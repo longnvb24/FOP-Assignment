@@ -374,7 +374,7 @@ def run_simulation(grid, robots, goods,
 
     grid       - warehouse grid (list of lists)
     robots     - list of Robot objects (list)
-    goods      - list of Good objects; modified in-place (list)
+    goods      - list of Good objects (list)
     max_steps  - maximum number of timesteps to run (int)
     step_delay - pause duration between frames in seconds (float)
     spawn_prob - probability of a new good appearing each step (float)
@@ -398,7 +398,10 @@ def run_simulation(grid, robots, goods,
     fig.suptitle("Robotic Warehouse Simulation", fontsize=14, fontweight="bold")
     plt.tight_layout(pad=2.5)
 
-    for step in range(1, max_steps + 1):
+    step = 1
+    simulation_running = True
+
+    while step <= max_steps and simulation_running:
 
         # 1. Update all robots
         for robot in robots:
@@ -407,7 +410,8 @@ def run_simulation(grid, robots, goods,
 
         # 2. Randomly spawn a new good (if enabled)
         if spawn_prob > 0 and random.random() < spawn_prob and candidates:
-            goods.append(Good(*random.choice(candidates)))
+            r, c = random.choice(candidates)
+            goods.append(Good(r, c))
 
         # 3. Record statistics
         total_delivered = sum(r.goods_delivered for r in robots)
@@ -429,7 +433,9 @@ def run_simulation(grid, robots, goods,
         # 5. Early exit: all goods collected and no more will spawn
         if not goods and spawn_prob == 0 and num_idle == len(robots):
             print(f"\nAll goods collected after {step} steps.")
-            break
+            simulation_running = False
+        else:
+            step += 1
 
     plt.ioff()
     draw_frame(fig, axes, grid, robots, goods,
@@ -534,11 +540,6 @@ def draw_frame(fig, axes, grid, robots, goods,
     ax_del.cla()
     ax_del.plot(x, hist_del, color="#2ecc71", linewidth=2, label="Delivered")
     ax_del.fill_between(x, hist_del, alpha=0.2, color="#2ecc71")
-    if hist_del:
-        ideal = [hist_del[-1] / len(hist_del) * i for i in range(1, len(x)+1)]
-        ax_del.plot(x, ideal, color="gray", linewidth=1,
-                    linestyle=":", label="Ideal rate")
-        ax_del.legend(fontsize=8)
     ax_del.set_title("Cumulative Deliveries", fontsize=10)
     ax_del.set_xlabel("Timestep")
     ax_del.set_ylabel("Goods delivered")
@@ -636,7 +637,7 @@ def interactive_setup():
     Run with: python3 warehouse.py -i
     '''
     print("\n" + "=" * 52)
-    print("  WAREHOUSE SIMULATION  –  Interactive Setup")
+    print("  WAREHOUSE SIMULATION  -  Interactive Setup")
     print("=" * 52)
 
     rows       = prompt_int("Grid rows (5-50)",              5,   50,  12)
@@ -661,10 +662,6 @@ def interactive_setup():
     }
     return grid, robots, goods, params
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Batch mode  (-f map.csv -p params.csv)
-# ══════════════════════════════════════════════════════════════════════════════
 def load_params_csv(filepath):
     '''
     load_params_csv - reads simulation parameters from a key-value CSV file.
@@ -682,10 +679,11 @@ def load_params_csv(filepath):
     '''
     params = {}
     with open(filepath, newline="", encoding="utf-8") as f:
-        for row in csv.reader(f):
-            if len(row) >= 2:
-                key = row[0].strip()
-                val = row[1].strip()
+        for row in f:
+            parts = row.strip().split(",")
+            if len(parts) >= 2:
+                key = parts[0].strip()
+                val = parts[1].strip()
                 try:
                     params[key] = int(val)
                 except ValueError:
@@ -713,21 +711,21 @@ def batch_setup(map_file, params_file):
         if not grid or not grid[0]:
             raise ValueError("Map file is empty.")
     except FileNotFoundError:
-        print(f"Warning: '{map_file}' not found – using default 12x14 grid.")
+        print(f"Warning: '{map_file}' not found - using default 12x14 grid.")
         grid = make_grid(12, 14)
         add_shelves(grid)
     except Exception as e:
-        print(f"Warning: could not read map ({e}) – using default grid.")
+        print(f"Warning: could not read map ({e}) - using default grid.")
         grid = make_grid(12, 14)
         add_shelves(grid)
 
     try:
         params = load_params_csv(params_file)
     except FileNotFoundError:
-        print(f"Warning: '{params_file}' not found – using default parameters.")
+        print(f"Warning: '{params_file}' not found - using default parameters.")
         params = {}
     except Exception as e:
-        print(f"Warning: could not read parameters ({e}) – using defaults.")
+        print(f"Warning: could not read parameters ({e}) - using defaults.")
         params = {}
 
     num_robots = int(params.get("num_robots",   4))
